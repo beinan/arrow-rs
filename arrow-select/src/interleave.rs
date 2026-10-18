@@ -384,21 +384,37 @@ fn interleave_list<O: OffsetSizeTrait>(
         );
     }
 
-    let mut child_indices = Vec::with_capacity(capacity);
-    for (array, row) in indices {
-        let list = interleaved.arrays[*array];
-        let start = list.value_offsets()[*row].as_usize();
-        let end = list.value_offsets()[*row + 1].as_usize();
-        child_indices.extend((start..end).map(|i| (*array, i)));
-    }
-
     let child_arrays: Vec<&dyn Array> = interleaved
         .arrays
         .iter()
         .map(|list| list.values().as_ref())
         .collect();
 
-    let interleaved_values = interleave(&child_arrays, &child_indices)?;
+    let interleaved_values = if field.data_type().is_primitive() {
+        // Copy each selected primitive range directly. Expanding every child
+        // into an (array, row) pair costs 16 temporary bytes per value on 64-bit
+        // hosts, even when a list contains millions of contiguous values.
+        let data: Vec<_> = child_arrays.iter().map(|array| array.to_data()).collect();
+        let mut output = MutableArrayData::new(data.iter().collect(), false, capacity);
+        for (array, row) in indices {
+            let offsets = interleaved.arrays[*array].value_offsets();
+            output.extend(
+                *array,
+                offsets[*row].as_usize(),
+                offsets[*row + 1].as_usize(),
+            );
+        }
+        make_array(output.freeze())
+    } else {
+        let mut child_indices = Vec::with_capacity(capacity);
+        for (array, row) in indices {
+            let list = interleaved.arrays[*array];
+            let start = list.value_offsets()[*row].as_usize();
+            let end = list.value_offsets()[*row + 1].as_usize();
+            child_indices.extend((start..end).map(|i| (*array, i)));
+        }
+        interleave(&child_arrays, &child_indices)?
+    };
 
     let offsets = OffsetBuffer::new(offsets.into());
     let list_array = GenericListArray::<O>::new(
@@ -758,6 +774,73 @@ mod tests {
         let expected = expected.finish();
 
         assert_eq!(v, &expected);
+    }
+
+    fn primitive_list_ranges_preserve_slices_nulls_and_repeats<O: OffsetSizeTrait>() {
+        let a = GenericListArray::<O>::from_iter_primitive::<Int64Type, _, _>([
+            Some(vec![Some(99), Some(98)]),
+            Some(vec![Some(1), None, Some(3)]),
+            None,
+            Some(vec![]),
+            Some(vec![Some(7), Some(8)]),
+        ])
+        .slice(1, 4);
+        let b = GenericListArray::<O>::from_iter_primitive::<Int64Type, _, _>([
+            Some(vec![Some(4), Some(5)]),
+            Some(vec![None, Some(6)]),
+        ]);
+        let actual =
+            interleave(&[&a, &b], &[(0, 3), (1, 1), (0, 1), (0, 2), (0, 0), (1, 1)]).unwrap();
+        let expected = GenericListArray::<O>::from_iter_primitive::<Int64Type, _, _>([
+            Some(vec![Some(7), Some(8)]),
+            Some(vec![None, Some(6)]),
+            None,
+            Some(vec![]),
+            Some(vec![Some(1), None, Some(3)]),
+            Some(vec![None, Some(6)]),
+        ]);
+        assert_eq!(actual.as_ref(), &expected as &dyn Array);
+    }
+
+    #[test]
+    fn primitive_list_ranges_keep_slices_nulls_and_repeats() {
+        primitive_list_ranges_preserve_slices_nulls_and_repeats::<i32>();
+        primitive_list_ranges_preserve_slices_nulls_and_repeats::<i64>();
+    }
+
+    #[test]
+    fn primitive_list_ranges_keep_timestamp_timezone_and_hidden_null_payload() {
+        let values = TimestampMicrosecondArray::from(vec![Some(1), None, Some(3), Some(4)])
+            .with_timezone("UTC");
+        let field = Arc::new(arrow_schema::Field::new(
+            "item",
+            values.data_type().clone(),
+            true,
+        ));
+        let lists = ListArray::new(
+            field.clone(),
+            OffsetBuffer::new(vec![0_i32, 2, 4].into()),
+            Arc::new(values),
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let actual = interleave(&[&lists], &[(0, 1), (0, 0), (0, 1)]).unwrap();
+        let expected = ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0_i32, 2, 4, 6].into()),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![
+                    Some(3),
+                    Some(4),
+                    Some(1),
+                    None,
+                    Some(3),
+                    Some(4),
+                ])
+                .with_timezone("UTC"),
+            ),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        assert_eq!(actual.as_ref(), &expected as &dyn Array);
     }
 
     #[test]
